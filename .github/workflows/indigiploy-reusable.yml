@@ -1,0 +1,403 @@
+name: Indigiploy manifest runner
+
+on:
+  workflow_call:
+    inputs:
+      master-url:
+        description: Public base URL of the Indigiploy master
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      targets: ${{ steps.resolve.outputs.targets }}
+    steps:
+      - name: Resolve matching deployment targets
+        id: resolve
+        env:
+          INDIGIPLOY_MASTER_URL: ${{ inputs.master-url }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+
+          def oidc_token():
+              url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+              separator = "&" if "?" in url else "?"
+              request = urllib.request.Request(
+                  url + separator + urllib.parse.urlencode({"audience": "indigiploy-master"}),
+                  headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+              )
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.loads(response.read())["value"]
+
+          root = os.environ["INDIGIPLOY_MASTER_URL"].rstrip("/")
+          request = urllib.request.Request(
+              root + "/api/cicd/target-runs/resolve",
+              data=b"{}",
+              headers={"Authorization": "Bearer " + oidc_token(), "Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              targets = json.loads(response.read()).get("resolutions", [])
+          if not targets:
+              targets = [{"skip": True}]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("targets=" + json.dumps(targets, separators=(",", ":")) + "\n")
+          print("Resolved {} matching target(s).".format(sum(not item.get("skip", False) for item in targets)))
+          PY
+
+  build:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.targets != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Check out application source
+        if: ${{ matrix.target.skip != true }}
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Pull frozen target manifest and build secrets
+        if: ${{ matrix.target.skip != true }}
+        id: manifest
+        env:
+          INDIGIPLOY_MASTER_URL: ${{ inputs.master-url }}
+          INDIGIPLOY_TARGET_RUN_ID: ${{ matrix.target.id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.parse, urllib.request
+
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          separator = "&" if "?" in url else "?"
+          token_request = urllib.request.Request(
+              url + separator + urllib.parse.urlencode({"audience": "indigiploy-master"}),
+              headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          with urllib.request.urlopen(token_request, timeout=20) as response:
+              token = json.loads(response.read())["value"]
+          endpoint = os.environ["INDIGIPLOY_MASTER_URL"].rstrip("/") + "/api/cicd/target-runs/" + os.environ["INDIGIPLOY_TARGET_RUN_ID"] + "/manifest"
+          request = urllib.request.Request(endpoint, headers={"Authorization": "Bearer " + token})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              manifest = json.loads(response.read())["manifest"]
+          for item in manifest.get("buildSecrets", []):
+              value = item["value"]
+              if "\n" in value or "\r" in value:
+                  raise SystemExit("Build secret values cannot contain line breaks.")
+              print("::add-mask::" + value)
+          manifest_path = os.path.join(os.environ["RUNNER_TEMP"], "indigiploy-manifest.json")
+          with open(manifest_path, "w", encoding="utf-8") as target:
+              os.chmod(manifest_path, 0o600)
+              json.dump(manifest, target, separators=(",", ":"))
+          config = manifest["configuration"]
+          uses_bun = any(
+              re.search(r"(?:^|[\s;&|()])bun(?=\s)", step.get("run", ""))
+              for step in config.get("buildSteps", [])
+          )
+          uses_node = any(
+              re.search(r"(?:^|[\s;&|()])(?:npm|npx|yarn|pnpm)(?=\s)", step.get("run", ""))
+              for step in config.get("buildSteps", [])
+          )
+          node_version = config["runtimeVersion"] if config["runtime"] == "node" else ("22" if uses_node else "")
+          values = {
+              "runtime": config["runtime"],
+              "runtime-version": config["runtimeVersion"],
+              "node-version": node_version,
+              "uses-bun": str(uses_bun).lower(),
+              "artifact-type": config["artifactType"],
+              "source-directory": config["sourceDirectory"],
+              "artifact-name": config["artifactName"],
+              "web-root": config.get("webRoot", ""),
+              "dockerfile": config.get("dockerfileName", ""),
+              "docker-context": config.get("dockerContext", ""),
+              "image-name": config.get("imageName", ""),
+              "is-pull-request": str(manifest["isPullRequest"]).lower(),
+              "manifest-path": manifest_path,
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              for name, value in values.items():
+                  output.write(name + "=" + value + "\n")
+          PY
+
+      - name: Set up Node.js
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.node-version != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.manifest.outputs.node-version }}
+
+      - name: Set up Bun
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.uses-bun == 'true' }}
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up PHP
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.runtime == 'php' }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ steps.manifest.outputs.runtime-version }}
+          coverage: none
+
+      - name: Set up Python
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.runtime == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.manifest.outputs.runtime-version }}
+
+      - name: Set up Go
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.runtime == 'go' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.manifest.outputs.runtime-version }}
+
+      - name: Run target build steps
+        if: ${{ matrix.target.skip != true }}
+        env:
+          INDIGIPLOY_MANIFEST_PATH: ${{ steps.manifest.outputs.manifest-path }}
+          INDIGIPLOY_MASTER_URL: ${{ inputs.master-url }}
+          INDIGIPLOY_TARGET_RUN_ID: ${{ matrix.target.id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, urllib.parse, urllib.request
+
+          with open(os.environ["INDIGIPLOY_MANIFEST_PATH"], encoding="utf-8") as source:
+              manifest = json.load(source)
+          config = manifest["configuration"]
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          source_dir = (root / config["sourceDirectory"]).resolve()
+          if root not in source_dir.parents and source_dir != root:
+              raise SystemExit("Configured source directory escapes the repository.")
+          if not source_dir.is_dir():
+              raise SystemExit("Configured source directory does not exist.")
+          env = os.environ.copy()
+          for secret in manifest.get("buildSecrets", []):
+              env[secret["name"]] = secret["value"]
+
+          def report_failure(step, message):
+              url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+              separator = "&" if "?" in url else "?"
+              token_request = urllib.request.Request(
+                  url + separator + urllib.parse.urlencode({"audience": "indigiploy-master"}),
+                  headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+              )
+              with urllib.request.urlopen(token_request, timeout=20) as response:
+                  token = json.loads(response.read())["value"]
+              body = json.dumps({"failedStep": step, "error": message}).encode()
+              request = urllib.request.Request(
+                  os.environ["INDIGIPLOY_MASTER_URL"].rstrip("/") + "/api/cicd/target-runs/" + os.environ["INDIGIPLOY_TARGET_RUN_ID"] + "/fail",
+                  data=body,
+                  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  response.read()
+
+          for step in config.get("buildSteps", []):
+              workdir = root / step.get("workingDirectory", config["sourceDirectory"])
+              workdir = workdir.resolve()
+              if root not in workdir.parents and workdir != root:
+                  raise SystemExit("A configured build step directory escapes the repository.")
+              if not workdir.is_dir():
+                  raise SystemExit("A configured build step directory does not exist.")
+              print("::group::" + step["name"])
+              result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=workdir, env=env)
+              print("::endgroup::")
+              if result.returncode:
+                  report_failure(step["name"], "Command exited with status {}.".format(result.returncode))
+                  raise SystemExit(result.returncode)
+          PY
+
+      - name: Package PHP release
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.artifact-type == 'php' && steps.manifest.outputs.is-pull-request != 'true' }}
+        env:
+          INDIGIPLOY_SOURCE_DIRECTORY: ${{ steps.manifest.outputs.source-directory }}
+          INDIGIPLOY_WEB_ROOT: ${{ steps.manifest.outputs.web-root }}
+        run: |
+          set -euo pipefail
+          source_dir="$GITHUB_WORKSPACE/$INDIGIPLOY_SOURCE_DIRECTORY"
+          test -d "$source_dir/$INDIGIPLOY_WEB_ROOT" || { echo "Configured PHP web root does not exist." >&2; exit 1; }
+          python3 - "$source_dir" <<'PY'
+          import os, pathlib, sys
+
+          root = pathlib.Path(sys.argv[1]).resolve()
+          excluded_parts = {".env", ".git", ".github", "node_modules", "tests"}
+
+          def excluded(path):
+              return any(part in excluded_parts for part in path.parts)
+
+          for current, directories, files in os.walk(root, followlinks=False):
+              for name in directories + files:
+                  candidate = pathlib.Path(current) / name
+                  relative = candidate.relative_to(root)
+                  if excluded(relative) or not candidate.is_symlink():
+                      continue
+                  try:
+                      target = candidate.resolve(strict=True)
+                      target_relative = target.relative_to(root)
+                  except (OSError, RuntimeError, ValueError):
+                      raise SystemExit("PHP release contains a broken or escaping symbolic link.")
+                  if excluded(target_relative) or not (target.is_file() or target.is_dir()):
+                      raise SystemExit("PHP release contains a symbolic link to an excluded or unsupported path.")
+              directories[:] = [name for name in directories if name not in excluded_parts]
+          PY
+          mkdir -p "$RUNNER_TEMP/indigiploy"
+          tar -czf "$RUNNER_TEMP/indigiploy/release.tar.gz" --dereference --hard-dereference --exclude-vcs --exclude=.github --exclude=./.github --exclude=node_modules --exclude='*/node_modules' --exclude=.env --exclude='*/.env' -C "$source_dir" .
+          entry_count=$(tar -tzf "$RUNNER_TEMP/indigiploy/release.tar.gz" | wc -l | tr -d ' ')
+          test "$entry_count" -le 50000 || { echo "PHP release contains too many entries." >&2; exit 1; }
+
+      - name: Upload PHP release artifact
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.artifact-type == 'php' && steps.manifest.outputs.is-pull-request != 'true' }}
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.manifest.outputs.artifact-name }}
+          path: ${{ runner.temp }}/indigiploy/release.tar.gz
+          if-no-files-found: error
+
+      - name: Set up Docker Buildx
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.artifact-type == 'docker' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.artifact-type == 'docker' && steps.manifest.outputs.is-pull-request != 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish immutable container image
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.artifact-type == 'docker' }}
+        id: publish
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ steps.manifest.outputs.docker-context }}
+          file: ${{ steps.manifest.outputs.dockerfile }}
+          push: ${{ steps.manifest.outputs.is-pull-request != 'true' }}
+          tags: ${{ steps.manifest.outputs.image-name }}:sha-${{ github.sha }}
+
+      - name: Register published artifact with Master
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.is-pull-request != 'true' }}
+        env:
+          INDIGIPLOY_MASTER_URL: ${{ inputs.master-url }}
+          INDIGIPLOY_TARGET_RUN_ID: ${{ matrix.target.id }}
+          INDIGIPLOY_ARTIFACT_TYPE: ${{ steps.manifest.outputs.artifact-type }}
+          INDIGIPLOY_ARTIFACT_NAME: ${{ steps.manifest.outputs.artifact-name }}
+          INDIGIPLOY_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          INDIGIPLOY_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          INDIGIPLOY_IMAGE_NAME: ${{ steps.manifest.outputs.image-name }}
+          INDIGIPLOY_IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+
+          with open(os.environ["INDIGIPLOY_ARTIFACT_TYPE"] and os.environ["RUNNER_TEMP"] + "/indigiploy-manifest.json", encoding="utf-8") as source:
+              manifest = json.load(source)
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          if os.environ["INDIGIPLOY_ARTIFACT_TYPE"] == "php":
+              artifact_id = os.environ["INDIGIPLOY_ARTIFACT_ID"]
+              digest = os.environ["INDIGIPLOY_ARTIFACT_DIGEST"]
+              if not artifact_id or not digest:
+                  raise SystemExit("GitHub did not return the PHP artifact ID and digest.")
+              if not digest.startswith("sha256:"):
+                  digest = "sha256:" + digest
+              artifact_info = {
+                  "provider": "github-actions",
+                  "name": os.environ["INDIGIPLOY_ARTIFACT_NAME"],
+                  "artifactId": artifact_id,
+                  "downloadUrl": "https://api.github.com/repos/{}/actions/artifacts/{}/zip".format(repository, artifact_id),
+                  "pageUrl": "https://github.com/{}/actions/runs/{}/artifacts/{}".format(repository, run_id, artifact_id),
+                  "repository": repository,
+                  "digest": digest,
+                  "commitSha": os.environ["GITHUB_SHA"],
+                  "workflowRunId": run_id,
+                  "workflowRunAttempt": attempt,
+              }
+          else:
+              digest = os.environ["INDIGIPLOY_IMAGE_DIGEST"]
+              if not digest.startswith("sha256:"):
+                  raise SystemExit("The container publisher did not return a SHA-256 digest.")
+              image = os.environ["INDIGIPLOY_IMAGE_NAME"]
+              package_name = image.rsplit("/", 1)[-1]
+              artifact_info = {
+                  "provider": "github-container-registry",
+                  "image": image,
+                  "pageUrl": "https://github.com/{}/pkgs/container/{}".format(repository, package_name),
+                  "repository": repository,
+                  "digest": digest,
+                  "commitSha": os.environ["GITHUB_SHA"],
+                  "workflowRunId": run_id,
+                  "workflowRunAttempt": attempt,
+              }
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          separator = "&" if "?" in url else "?"
+          token_request = urllib.request.Request(
+              url + separator + urllib.parse.urlencode({"audience": "indigiploy-master"}),
+              headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          with urllib.request.urlopen(token_request, timeout=20) as response:
+              token = json.loads(response.read())["value"]
+          body = json.dumps({"artifactInfo": artifact_info}, separators=(",", ":")).encode()
+          request = urllib.request.Request(
+              os.environ["INDIGIPLOY_MASTER_URL"].rstrip("/") + "/api/cicd/target-runs/" + os.environ["INDIGIPLOY_TARGET_RUN_ID"] + "/complete",
+              data=body,
+              headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              response.read()
+          print("Master registered the artifact for this target.")
+          PY
+
+      - name: Complete pull request validation run
+        if: ${{ matrix.target.skip != true && steps.manifest.outputs.is-pull-request == 'true' && success() }}
+        env:
+          INDIGIPLOY_MASTER_URL: ${{ inputs.master-url }}
+          INDIGIPLOY_TARGET_RUN_ID: ${{ matrix.target.id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          separator = "&" if "?" in url else "?"
+          token_request = urllib.request.Request(url + separator + urllib.parse.urlencode({"audience": "indigiploy-master"}), headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          with urllib.request.urlopen(token_request, timeout=20) as response:
+              token = json.loads(response.read())["value"]
+          request = urllib.request.Request(os.environ["INDIGIPLOY_MASTER_URL"].rstrip("/") + "/api/cicd/target-runs/" + os.environ["INDIGIPLOY_TARGET_RUN_ID"] + "/complete", data=b"{}", headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
+          with urllib.request.urlopen(request, timeout=30) as response:
+              response.read()
+          PY
+
+      - name: Report failed target run to Master
+        if: ${{ matrix.target.skip != true && failure() }}
+        env:
+          INDIGIPLOY_MASTER_URL: ${{ inputs.master-url }}
+          INDIGIPLOY_TARGET_RUN_ID: ${{ matrix.target.id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          separator = "&" if "?" in url else "?"
+          token_request = urllib.request.Request(url + separator + urllib.parse.urlencode({"audience": "indigiploy-master"}), headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          with urllib.request.urlopen(token_request, timeout=20) as response:
+              token = json.loads(response.read())["value"]
+          body = json.dumps({"failedStep": "GitHub Actions setup, build, or publish", "error": "Open the linked GitHub Actions run for step details."}).encode()
+          request = urllib.request.Request(os.environ["INDIGIPLOY_MASTER_URL"].rstrip("/") + "/api/cicd/target-runs/" + os.environ["INDIGIPLOY_TARGET_RUN_ID"] + "/fail", data=body, headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
+          with urllib.request.urlopen(request, timeout=30) as response:
+              response.read()
+          PY
